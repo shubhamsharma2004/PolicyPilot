@@ -1,11 +1,15 @@
 # app/main.py
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Tuple
-from pathlib import Path
-from dotenv import load_dotenv
-import os, re
 
 # Vector store / embeddings
 from langchain_community.vectorstores import Chroma
@@ -14,23 +18,33 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 # ──────────────────────────────────────────────────────────────────────────────
 # Env & basic config
 # ──────────────────────────────────────────────────────────────────────────────
-ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(ENV_PATH)
+ROOT_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = ROOT_DIR / ".env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
 
+# API keys (prefer GEMINI_API_KEY; allow GOOGLE_API_KEY fallback)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
 if not GEMINI_API_KEY:
-    raise RuntimeError("❌ GEMINI_API_KEY (or GOOGLE_API_KEY) not set in .env")
+    # For production, fail fast is better than silent breakage
+    raise RuntimeError("❌ Missing GEMINI_API_KEY (or GOOGLE_API_KEY). Set it in Render/Vercel env.")
 
-INDEX_DIR = os.getenv("INDEX_DIR", "../storage/index")
+# Vector index path (persisted if your platform provides a disk)
+INDEX_DIR = os.getenv("INDEX_DIR", str(ROOT_DIR / "storage" / "index"))
+
+# Comma-separated origins, e.g. "http://localhost:5173,https://your-frontend.vercel.app"
+FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "FRONTEND_ORIGINS=https://policy-pilot.vercel.app,http://localhost:5173
+")
+ALLOWED_ORIGINS = [o.strip() for o in FRONTEND_ORIGINS.split(",") if o.strip()]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Embeddings & VectorStore
 # ──────────────────────────────────────────────────────────────────────────────
-def get_embeddings():
-    # IMPORTANT: Google GenAI embeddings expect the fully-qualified model name
+def get_embeddings() -> GoogleGenerativeAIEmbeddings:
+    # Google GenAI embeddings expect the fully-qualified model name
     return GoogleGenerativeAIEmbeddings(
         model="models/text-embedding-004",
-        google_api_key=GEMINI_API_KEY
+        google_api_key=GEMINI_API_KEY,
     )
 
 def get_vectorstore() -> Chroma:
@@ -39,7 +53,7 @@ def get_vectorstore() -> Chroma:
     return Chroma(
         collection_name="policies",
         embedding_function=emb,
-        persist_directory=INDEX_DIR
+        persist_directory=INDEX_DIR,
     )
 
 vs = get_vectorstore()
@@ -66,17 +80,19 @@ PHRASE_GROUPS: Dict[str, List[str]] = {
     "bonus act": ["bonus act", "statutory bonus"],
     "health insurance": ["health insurance"],
     "posh": ["posh", "safe workplace", "internal committee"],
-    "leave": ["leave policy", "annual / earned leave", "earned leave", "annual leave", "sick leave", "casual leave", "compensatory off", "maternity", "paternity"],
+    "leave": [
+        "leave policy", "annual / earned leave", "earned leave", "annual leave",
+        "sick leave", "casual leave", "compensatory off", "maternity", "paternity"
+    ],
 }
 
-# Detects bullets / numbered items / paragraphs
-BULLET_START = re.compile(r"^\s*(?:[\-\*•●]|(\d+(\.\d+)*|\d+)\s*[\.\)])\s*|^\s*$", re.UNICODE)
+# Detect bullets / numbered items / paragraph breaks
+BULLET_START = re.compile(r"^\s*(?:[\-\*•●]|(\d+(?:\.\d+)*)\s*[\.\)])\s*|^\s*$", re.UNICODE)
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def _split_lines(text: str) -> List[str]:
-    # Keep original line breaks so “paragraph expansion” works
     return text.splitlines()
 
 def _is_bullet_or_break(line: str) -> bool:
@@ -89,7 +105,6 @@ def _expand_to_clause(lines: List[str], hit_index: int, max_up: int = 2, max_dow
     """
     n = len(lines)
     start = hit_index
-    # Move up to start of the bullet/paragraph (or up to max_up lines)
     up_steps = 0
     while start > 0 and up_steps < max_up:
         if _is_bullet_or_break(lines[start - 1]):
@@ -110,7 +125,8 @@ def _expand_to_clause(lines: List[str], hit_index: int, max_up: int = 2, max_dow
 
 def _find_hits(question: str, lines: List[str]) -> List[int]:
     q = question.lower()
-    # Prefer phrase groups
+
+    # Prefer phrase groups if any phrase is present in the question
     for phrases in PHRASE_GROUPS.values():
         if any(p in q for p in phrases):
             hits = []
@@ -123,10 +139,10 @@ def _find_hits(question: str, lines: List[str]) -> List[int]:
 
     # Fallback: overlap on keywords in the question
     words = [w for w in re.findall(r"[a-zA-Z]{3,}", q)]
-    hits = []
+    hits: List[int] = []
     for i, l in enumerate(lines):
         score = sum(1 for w in words if w in l.lower())
-        if score >= max(1, len(words) // 4):  # lightweight threshold
+        if score >= max(1, len(words) // 4):
             hits.append(i)
     return hits
 
@@ -179,7 +195,7 @@ def compose_answer_from_citations(citations: List[Dict[str, Any]]) -> str:
 
     # Deduplicate identical snippets (trimmed) and concatenate
     seen = set()
-    parts = []
+    parts: List[str] = []
     for c in citations[:3]:
         snip = c.get("snippet", "").strip()
         key = _norm(snip)
@@ -208,23 +224,36 @@ app = FastAPI(title="Company Policy Assistant (Clause Mode)", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+@app.get("/")
+def root():
+    return {
+        "name": "Company Policy Assistant (Clause Mode)",
+        "version": "2.0",
+        "health": "/healthz",
+        "ask": "POST /ask { question: string }",
+        "index_dir": INDEX_DIR,
+        "origins": ALLOWED_ORIGINS,
+        "provider": "gemini",
+    }
+
 @app.get("/healthz")
 def healthz():
     try:
-        # quick peek at the collection size
-        count = 0
+        # Try to read collection count via chromadb collection
+        count = None
         try:
-            # Chroma doesn’t expose count directly; fetch small retriever to force load
-            _ = vs.as_retriever(search_type="mmr", search_kwargs={"k": 1})
-            count = len(vs._collection.get()["ids"])  # internal but works for sanity
+            # LangChain's Chroma exposes underlying chromadb collection
+            # count() exists on chromadb collection
+            count = vs._collection.count()  # type: ignore[attr-defined]
         except Exception:
-            pass
+            # Fallback: attempt a small retrieval to ensure index is accessible
+            _ = vs.as_retriever(search_type="mmr", search_kwargs={"k": 1})
         return {"ok": True, "model_provider": "gemini", "index_dir": INDEX_DIR, "chroma_count": count}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -232,7 +261,7 @@ def healthz():
 @app.post("/ask", response_model=AskOut)
 def ask(body: AskIn):
     try:
-        q = body.question.strip()
+        q = (body.question or "").strip()
         if not q:
             return AskOut(answer="Please enter a question.", confidence="low")
 
@@ -255,7 +284,7 @@ def ask(body: AskIn):
         conf = "high" if len(citations) >= 2 else "medium"
 
         # Simple follow-ups based on what was asked
-        followups = []
+        followups: List[str] = []
         lq = q.lower()
         if "leave" in lq:
             followups = [
@@ -282,6 +311,7 @@ def ask(body: AskIn):
             follow_up_suggestions=followups
         )
     except Exception as e:
+        # Avoid leaking sensitive stack traces; keep message concise
         return AskOut(
             answer="I don’t have that in policy.",
             citations=[],
@@ -289,3 +319,15 @@ def ask(body: AskIn):
             confidence="low",
             follow_up_suggestions=[f"Error: {str(e)[:120]}"]
         )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Local run convenience (useful for testing on Windows)
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=bool(os.getenv("RELOAD", "0") == "1"),
+    )
